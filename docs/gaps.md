@@ -56,7 +56,8 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
   import through Open Project, Import, the media browser and CLI. Reads bins, media, sequences,
   tracks, cuts, fixed speed/reverse, linked clips, nests and mapped effects/keyframes/transitions.
   Imported projects save as `.fcproj`; Premiere files are never overwritten by Save.
-- **Still missing:** real-project fidelity validation, titles/shapes/masks, unsupported plug-ins,
+- **Still missing:** real-project fidelity validation, titles/shapes/masks, exact Time Remapping
+  temporal easing (source-position keyframes import as piecewise speed segments), unsupported plug-ins,
   complete metadata and native `.prproj` export. Unsupported content is reported where detected;
   name-based effect mapping does not prove visual equivalence. The beta blocker remains open.
 - **Validation:** synthetic timeline/retime and malformed-input regression tests; failed Open

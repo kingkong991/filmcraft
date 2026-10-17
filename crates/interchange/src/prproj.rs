@@ -11,8 +11,9 @@
 //! premiere's effects pretty closely, and the settings get matched by name too
 //! theres a small alias list for the few settings premiere doesn't name or names differently
 //! and the values get converted where the units are different like volume and position
-//! keyframes come over too, premiere saves them in the source clips time and filmcraft uses
+//! effect keyframes come over too, premiere saves them in the source clips time and filmcraft uses
 //! that same time so they come over as is, and transitions get hooked up to the clips on each side of the cut
+//! time remapping source-position keys become piecewise speed segments; easing is approximated
 //!
 //! some stuff cant come over yet like titles and shapes, and masks
 
@@ -35,6 +36,7 @@ use crate::{Error, Format, ImportOptions, Imported, Report, Result};
 const MAX_XML: usize = 512 << 20;
 const MAX_BIN_DEPTH: usize = 64;
 const MAX_TRACKS: usize = 256;
+const MAX_REMAP_KEYS: usize = 10_000;
 const ALIAS: &[(&str, &str, &str)] = &[
     ("motion", "4", "Uniform Scale"),
     ("crop", "5", "Zoom"),
@@ -232,6 +234,7 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         if let Some(&id) = self.sources.get(&seq.id()) {
             return id;
         }
+        let name = child_text(seq, "Name").filter(|n| !n.trim().is_empty()).unwrap_or(name);
         let groups = self.objects.track_groups(seq);
         let group = |tag| groups.iter().copied().find(|g| g.has_tag_name(tag));
         let video = group("VideoTrackGroup");
@@ -398,6 +401,17 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             clip.gain_db = (20.0 * g.log10()).clamp(-96.0, 96.0);
         }
         self.read_fx(&mut clip, item, frame);
+        if let Some(param) = use_clip.and_then(|c| self.objects.at(c, &["Clip", "TimeRemapping"])).and_then(|r| self.objects.at(r, &["Keyframes"]))
+            && let Some(keys) = child_text(param, "Keyframes")
+        {
+            match import_time_remap(keys, &mut clip) {
+                Ok(n) if n > 1 => {
+                    self.report.warn(format!("clip \"{name}\" imported {n} Time Remapping keyframes as speed segments; temporal easing is approximated"))
+                }
+                Err(reason) => self.report.warn(format!("clip \"{name}\" Time Remapping was not imported: {reason}")),
+                _ => {}
+            }
+        }
         Some(clip)
     }
 
@@ -476,6 +490,72 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             }
         }
     }
+}
+
+/// Premiere's TimeComponentParam values are source positions in seconds, not speed percentages.
+/// A segment's source-position delta divided by its timeline delta gives its average speed.
+fn import_time_remap(raw: &str, clip: &mut TrackItem) -> std::result::Result<usize, &'static str> {
+    let count = raw.split(';').filter(|s| !s.trim().is_empty()).count();
+    if count <= 1 {
+        return Ok(count);
+    }
+    if count > MAX_REMAP_KEYS {
+        return Err("too many keyframes");
+    }
+    if clip.reverse || !(clip.speed.is_finite() && clip.speed > 0.0) {
+        return Err("reverse or invalid base speed");
+    }
+    let mut points = Vec::with_capacity(count);
+    for entry in raw.split(';').filter(|s| !s.trim().is_empty()) {
+        let mut fields = entry.split(',');
+        let time = fields.next().and_then(|s| s.trim().parse::<i64>().ok()).filter(|&t| t >= 0).ok_or("invalid keyframe time")?;
+        let position = fields
+            .next()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=10_000_000.0).contains(v))
+            .ok_or("invalid source position")?;
+        if points.last().is_some_and(|&(previous, _)| time <= previous) {
+            return Err("keyframe times are not increasing");
+        }
+        points.push((time, position));
+    }
+    let mut keys = Vec::with_capacity(count);
+    let mut last_percent = 100.0;
+    for pair in points.windows(2) {
+        let (a_time, a_pos) = pair[0];
+        let (b_time, b_pos) = pair[1];
+        let elapsed = (b_time - a_time) as f64 / TICKS_PER_SECOND as f64;
+        let percent = (b_pos - a_pos) / elapsed / clip.speed * 100.0;
+        if !percent.is_finite() || !(-10_000.0..=10_000.0).contains(&percent) {
+            return Err("segment speed is outside supported range");
+        }
+        let base_time = clip.source_in.0 as f64 + a_time as f64 * clip.speed;
+        if !(Tick::MIN.0 as f64..=Tick::MAX.0 as f64).contains(&base_time) {
+            return Err("keyframe time is outside supported range");
+        }
+        let time = Tick(base_time.round() as i64);
+        if keys.last().is_some_and(|previous: &Keyframe| time <= previous.time) {
+            return Err("keyframe times collapse at base speed");
+        }
+        let mut key = Keyframe::new(time, ParamValue::Float(percent));
+        key.interp = Interpolation::Hold;
+        keys.push(key);
+        last_percent = percent;
+    }
+    let last_time = points.last().map(|p| p.0).ok_or("no keyframes")?;
+    let base_time = clip.source_in.0 as f64 + last_time as f64 * clip.speed;
+    if !(Tick::MIN.0 as f64..=Tick::MAX.0 as f64).contains(&base_time) {
+        return Err("keyframe time is outside supported range");
+    }
+    let time = Tick(base_time.round() as i64);
+    if keys.last().is_some_and(|previous| time <= previous.time) {
+        return Err("keyframe times collapse at base speed");
+    }
+    keys.push(Keyframe::new(time, ParamValue::Float(last_percent)));
+    let effect = clip.effect_mut("time_remap").ok_or("Time Remapping effect is missing")?;
+    let speed = effect.param_mut("speed").ok_or("Speed parameter is missing")?;
+    speed.keyframes = keys;
+    Ok(count)
 }
 
 fn label<'a>(fx: &str, p: Node<'a, '_>) -> Option<&'a str> {

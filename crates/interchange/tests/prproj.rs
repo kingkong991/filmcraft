@@ -56,6 +56,54 @@ fn prproj_import_preserves_sequence_clip_timing_and_retime() {
 }
 
 #[test]
+fn prproj_import_uses_sequence_name_when_project_item_name_is_stale() {
+    let text = project().replace("</Sequence>", "<Name>test</Name></Sequence>");
+    let (imported, _) = import(&gzip(&text), Format::Prproj, None).unwrap();
+    let id = imported.sequences[0];
+    assert_eq!(imported.project.item(id).unwrap().name, "test");
+}
+
+#[test]
+fn prproj_imports_time_remapping_keyframes_as_speed_segments() {
+    let text = project()
+        .replace("<PlayBackwards>true</PlayBackwards>", "<PlayBackwards>false</PlayBackwards>")
+        .replace("<InPoint>127008000000</InPoint>", "<TimeRemapping ObjectRef=\"21\"/><InPoint>127008000000</InPoint>")
+        .replace(
+            "</PremiereData>",
+            "<TimeRemapping ObjectID=\"21\"><Keyframes ObjectRef=\"22\"/></TimeRemapping>\
+             <TimeComponentParam ObjectID=\"22\"><Name>Speed</Name><Keyframes>0,0,6,0,0,0,0,0;\
+             254016000000,2,7,0,0,0,0,0;508032000000,5,8,0,0,0,0,0;</Keyframes></TimeComponentParam></PremiereData>",
+        );
+    let (imported, report) = import(&gzip(&text), Format::Prproj, None).unwrap();
+    let sequence = imported.project.sequence(imported.sequences[0]).unwrap();
+    let clip = &sequence.video_tracks[0].items[0];
+    let speed = clip.effect("time_remap").unwrap().param("speed").unwrap();
+    assert_eq!(speed.keyframes.len(), 3);
+    assert!((speed.keyframes[0].value.as_f64().unwrap() - 100.0).abs() < 0.001);
+    assert!((speed.keyframes[1].value.as_f64().unwrap() - 150.0).abs() < 0.001);
+    assert_eq!(clip.source_time_at(clip.start + Tick(127_008_000_000)), clip.source_in + Tick(254_016_000_000));
+    assert!((clip.source_time_at(clip.start + Tick(381_024_000_000)) - (clip.source_in + Tick(889_056_000_000))).abs() <= Tick(4));
+    assert!(report.mentions("Shot\" imported 3 Time Remapping keyframes"));
+}
+
+#[test]
+fn malformed_time_remapping_keeps_clip_and_reports_error() {
+    let text = project()
+        .replace("<PlayBackwards>true</PlayBackwards>", "<PlayBackwards>false</PlayBackwards>")
+        .replace("<InPoint>127008000000</InPoint>", "<TimeRemapping ObjectRef=\"21\"/><InPoint>127008000000</InPoint>")
+        .replace(
+            "</PremiereData>",
+            "<TimeRemapping ObjectID=\"21\"><Keyframes ObjectRef=\"22\"/></TimeRemapping>\
+             <TimeComponentParam ObjectID=\"22\"><Keyframes>0,0,6;1,NaN,7;</Keyframes></TimeComponentParam></PremiereData>",
+        );
+    let result = std::panic::catch_unwind(|| import(&gzip(&text), Format::Prproj, None));
+    let (imported, report) = result.unwrap().unwrap();
+    let sequence = imported.project.sequence(imported.sequences[0]).unwrap();
+    assert_eq!(sequence.video_tracks[0].items.len(), 1);
+    assert!(report.mentions("Time Remapping was not imported: invalid source position"));
+}
+
+#[test]
 fn prproj_truncation_and_invalid_documents_return_errors() {
     let bytes = gzip(&project());
     for n in 0..bytes.len() {
